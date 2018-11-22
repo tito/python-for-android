@@ -4,24 +4,36 @@ from pythonforandroid.logger import logger, info, error
 from pythonforandroid.util import ensure_dir, walk_valid_filens
 from os.path import exists, join, dirname
 from os import environ
+import shutil
 import glob
 import sh
 
 STDLIB_DIR_BLACKLIST = {
     '__pycache__',
-    'test',
-    'tests',
-    'lib2to3',
+    'curses'
     'ensurepip',
     'idlelib',
+    'lib2to3',
+    'test',
+    'tests',
     'tkinter',
+    'turtledemo',
+    'venv',
+    'wsgiref',
 }
 
-STDLIB_FILEN_BLACKLIST = [
-    '*.pyc',
+
+STDLIB_FILEN_BLACKLIST_COMMON = [
     '*.exe',
     '*.whl',
+    'README',
+    'README.txt',
+    'distutils/command/command_template',
+    'email/architecture.rst'
 ]
+
+STDLIB_FILEN_BLACKLIST = STDLIB_FILEN_BLACKLIST_COMMON + ["*.pyc"]
+STDLIB_ZIP_FILEN_BLACKLIST = STDLIB_FILEN_BLACKLIST_COMMON + ["*.py"]
 
 # TODO: Move to a generic location so all recipes use the same blacklist
 SITE_PACKAGES_DIR_BLACKLIST = {
@@ -174,6 +186,7 @@ class Python3Recipe(TargetPythonRecipe):
 
     def create_python_bundle(self, dirn, arch):
         ndk_dir = self.ctx.ndk_dir
+        hostpython = sh.Command(self.ctx.hostpython)
 
         # Bundle compiled python modules to a folder
         modules_dir = join(dirn, 'modules')
@@ -187,24 +200,50 @@ class Python3Recipe(TargetPythonRecipe):
         module_filens = (glob.glob(join(modules_build_dir, '*.so')) +
                          glob.glob(join(modules_build_dir, '*.py')))
         for filen in module_filens:
-            shprint(sh.cp, filen, modules_dir)
+            shutil.copy2(filen, modules_dir)
 
         # zip up the standard library
+        # 1. copy only the files we want into the stdlib directory
+        # 2. compile them
+        # 3. remove some __pycache__ generated
+        # 4. zip it
         stdlib_zip = join(dirn, 'stdlib.zip')
+        stdlib_dir = join(dirn, 'stdlib')
+        ensure_dir(stdlib_dir)
+
         with current_directory(join(self.get_build_dir(arch.arch), 'Lib')):
             stdlib_filens = walk_valid_filens(
                 '.', STDLIB_DIR_BLACKLIST, STDLIB_FILEN_BLACKLIST)
+            for filen in stdlib_filens:
+                ensure_dir(join(stdlib_dir, dirname(filen)))
+                shutil.copy2(filen, join(stdlib_dir, filen))
+
+        with current_directory(stdlib_dir):
+            shprint(hostpython, '-m', 'compileall', '-f', '-b')
+            stdlib_filens = walk_valid_filens(
+                '.', STDLIB_DIR_BLACKLIST, STDLIB_ZIP_FILEN_BLACKLIST)
             shprint(sh.zip, stdlib_zip, *stdlib_filens)
 
-        # copy the site-packages into place
-        ensure_dir(join(dirn, 'site-packages'))
+        # copy & trim the site-packages into place
+        site_package_dir = join(dirn, 'site-packages')
+        ensure_dir(site_package_dir)
         # TODO: Improve the API around walking and copying the files
         with current_directory(self.ctx.get_python_install_dir()):
             filens = list(walk_valid_filens(
                 '.', SITE_PACKAGES_DIR_BLACKLIST, SITE_PACKAGES_FILEN_BLACKLIST))
             for filen in filens:
-                ensure_dir(join(dirn, 'site-packages', dirname(filen)))
-                sh.cp(filen, join(dirn, 'site-packages', filen))
+                ensure_dir(join(site_package_dir, dirname(filen)))
+                shutil.copy2(filen, join(site_package_dir, filen))
+
+        # trim site-packages
+        # XXX maybe export that as a function, and make it available for
+        # every package that goes into site-packages?
+        with current_directory(site_package_dir):
+            shprint(hostpython, '-m', 'compileall', '-f', '-b')
+            sh.find(".", "-iname", "*.py", "-delete")
+            # some pycache are recreated after compileall
+            sh.find(".", "-path", "*/__pycache__/*", "-delete")
+            sh.find(".", "-name", "__pycache__", "-type", "d", "-delete")
 
         # copy the python .so files into place
         python_build_dir = join(self.get_build_dir(arch.arch),
